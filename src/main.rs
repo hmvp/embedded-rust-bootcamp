@@ -1,17 +1,12 @@
-//! Blinks the LED on a Pico board
-//!
-//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
 #![no_std]
 #![no_main]
 
-use core::{
-    fmt::{self, Display, Write},
-    ops::Div,
-    write,
-};
-use cortex_m_rt::entry;
+use core::cell::RefCell;
+use core::fmt::Write;
 
 use arraystring::{typenum::U200, ArrayString};
+use cortex_m::{asm::nop, interrupt::Mutex};
+use cortex_m_rt::entry;
 use defmt::*;
 use defmt_rtt as _;
 use embedded_graphics::{
@@ -20,133 +15,45 @@ use embedded_graphics::{
     prelude::*,
     text::{Alignment, Text},
 };
-use embedded_hal::digital::v2::OutputPin;
-use embedded_time::{duration::Milliseconds, fixed_point::FixedPoint};
-use num::FromPrimitive;
+use embedded_hal::digital::v2::{OutputPin, StatefulOutputPin};
+use embedded_time::{duration::Extensions, fixed_point::FixedPoint};
 use panic_probe as _;
+
 // Provide an alias for our BSP so we can switch targets quickly.
-// Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
 use pimoroni_pico_explorer as bsp;
 
-use bsp::{Button, PicoExplorer, XOSC_CRYSTAL_FREQ};
+use bsp::{PicoExplorer, Screen, XOSC_CRYSTAL_FREQ};
 
 use bsp::hal::{
     adc::Adc,
     clocks::{init_clocks_and_plls, Clock},
-    pac,
+    gpio::{self, Interrupt::EdgeLow},
+    pac::{self, interrupt},
+    pwm,
     sio::Sio,
+    timer::{Alarm, Alarm0, Alarm1},
     watchdog::Watchdog,
+    Timer,
 };
 
-const MAX_DEPTH: u32 = 40_000;
-const MAX_SAFE_ASCEND_RATE: i32 = -15;
-const MAX_AIR: u32 = 2000 * 100;
-const AIR_INCREMENT: u32 = 500;
-const TIME_TICK_MS: u32 = 50;
+mod dive_computer;
+use dive_computer::*;
 
-#[derive(PartialEq)]
-enum Unit {
-    Metric,
-    Imperial,
-}
+const TIME_TICK_MS: u32 = 500;
 
-impl Display for Unit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let unit = match self {
-            Unit::Imperial => "FT",
-            Unit::Metric => "M",
-        };
+type APin = gpio::Pin<gpio::bank0::Gpio12, gpio::PullUpInput>;
+type BPin = gpio::Pin<gpio::bank0::Gpio13, gpio::PullUpInput>;
+type XPin = gpio::Pin<gpio::bank0::Gpio14, gpio::PullUpInput>;
+type YPin = gpio::Pin<gpio::bank0::Gpio15, gpio::PullUpInput>;
+type LEDPin = gpio::Pin<gpio::bank0::Gpio25, gpio::Output<gpio::PushPull>>;
 
-        // Write to buffer
-        write!(f, "{}", unit)
-    }
-}
+type Buttons = (APin, BPin, XPin, YPin);
+type LedScreenAlarm = (LEDPin, Screen, Alarm1);
 
-#[derive(Debug)]
-enum Alarm {
-    High,
-    Medium,
-    Low,
-    None,
-}
-impl Display for Alarm {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let alarm = match self {
-            Alarm::High => "HIGH",
-            Alarm::Medium => "MEDIUM",
-            Alarm::Low => "LOW",
-            Alarm::None => "NONE",
-        };
-
-        // Write to buffer
-        writeln!(f, "{:13}", alarm)
-    }
-}
-struct DiveComputer {
-    unit: Unit,
-    depth: u32,
-    rate: i32,
-    air: u32,
-    edt: Milliseconds,
-}
-
-impl DiveComputer {
-    fn get_alarm(&self) -> Alarm {
-        if gas_to_surface_in_cl(self.depth) > self.air {
-            return Alarm::High;
-        }
-
-        if self.rate < MAX_SAFE_ASCEND_RATE {
-            return Alarm::Medium;
-        }
-
-        if self.depth > MAX_DEPTH {
-            return Alarm::Low;
-        }
-
-        Alarm::None
-    }
-}
-
-impl Display for DiveComputer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let depth = if self.unit == Unit::Imperial {
-            mm2ft(self.depth)
-        } else {
-            self.depth / 1000
-        };
-        let rate = if self.unit == Unit::Imperial {
-            mm2ft(self.rate * 1000)
-        } else {
-            self.rate
-        };
-
-        let hours = self.edt / 3600000;
-        let minutes = self.edt.integer() % 3600000 / 60000;
-        let seconds = self.edt.integer() % 3600000 % 60000 / 1000;
-
-        // Write to buffer
-        writeln!(f, "DiveMaster")?;
-        writeln!(f, "")?;
-        writeln!(
-            f,
-            "DEPTH: {:width$}{}",
-            depth,
-            self.unit,
-            width = if self.unit == Unit::Imperial { 11 } else { 12 }
-        )?;
-        writeln!(
-            f,
-            "RATE: {:width$}{}/M",
-            rate,
-            self.unit,
-            width = if self.unit == Unit::Imperial { 10 } else { 11 }
-        )?;
-        writeln!(f, "AIR: {:14}L", self.air / 100)?;
-        writeln!(f, "EDT: {:10}:{:0>2}:{:0>2}", hours, minutes, seconds)?;
-        writeln!(f, "ALARM: {:13}", self.get_alarm())
-    }
-}
+static GLOBAL_DIVE_COMPUTER: Mutex<RefCell<Option<DiveComputer>>> = Mutex::new(RefCell::new(None));
+static GLOBAL_BUTTONS: Mutex<RefCell<Option<Buttons>>> = Mutex::new(RefCell::new(None));
+static GLOBAL_LED_SCREEN_ALARM: Mutex<RefCell<Option<LedScreenAlarm>>> = Mutex::new(RefCell::new(None));
+static GLOBAL_DIVE_TICK_ALARM: Mutex<RefCell<Option<Alarm0>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
@@ -156,120 +63,98 @@ fn main() -> ! {
 
     // Enable watchdog and clocks
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
-    let clocks = init_clocks_and_plls(
-        XOSC_CRYSTAL_FREQ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut pac.RESETS,
-        &mut watchdog,
-    )
-    .ok()
-    .unwrap();
+    let clocks = init_clocks_and_plls(XOSC_CRYSTAL_FREQ, pac.XOSC, pac.CLOCKS, pac.PLL_SYS, pac.PLL_USB, &mut pac.RESETS, &mut watchdog)
+        .ok()
+        .unwrap();
 
     let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().integer());
 
+    let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS);
+    let mut alarm0 = timer.alarm_0().unwrap();
+    alarm0.enable_interrupt();
+    let _ = alarm0.schedule(10.microseconds());
+    let mut alarm1 = timer.alarm_1().unwrap();
+    alarm1.enable_interrupt();
+    let _ = alarm1.schedule(10.microseconds());
     // Enable adc
     let adc = Adc::new(pac.ADC, &mut pac.RESETS);
 
     let sio = Sio::new(pac.SIO);
 
-    let (mut explorer, pins) = PicoExplorer::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        pac.SPI0,
-        adc,
-        &mut pac.RESETS,
-        &mut delay,
-    );
+    let (explorer, pins) = PicoExplorer::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, pac.SPI0, adc, &mut pac.RESETS, &mut delay);
 
-    // Create a fixed buffer to store screen contents
-    let mut buf = ArrayString::<U200>::new();
+    explorer.a.set_interrupt_enabled(EdgeLow, true);
+    explorer.b.set_interrupt_enabled(EdgeLow, true);
+    explorer.x.set_interrupt_enabled(EdgeLow, true);
+    explorer.y.set_interrupt_enabled(EdgeLow, true);
 
-    let mut dive_computer = DiveComputer {
-        unit: Unit::Metric,
-        air: 5000,
-        depth: 0,
-        edt: Milliseconds::new(0),
-        rate: 0,
-    };
+    let led = pins.led.into_push_pull_output();
 
-    let mut led = pins.led.into_push_pull_output();
+    let dive_computer = DiveComputer::default();
 
-    let mut counter = 0;
+    // Store for use in interrupts
+    cortex_m::interrupt::free(|cs| {
+        GLOBAL_BUTTONS.borrow(cs).replace(Some((explorer.a, explorer.b, explorer.x, explorer.y)));
+        GLOBAL_DIVE_COMPUTER.borrow(cs).replace(Some(dive_computer));
+        GLOBAL_LED_SCREEN_ALARM.borrow(cs).replace(Some((led, explorer.screen, alarm1)));
+        GLOBAL_DIVE_TICK_ALARM.borrow(cs).replace(Some(alarm0));
+
+        // Unmask the IO_BANK0 IRQ so that the NVIC interrupt controller
+        // will jump to the interrupt function when the interrupt occurs.
+        // We do this last so that the interrupt can't go off while
+        // it is in the middle of being configured
+        unsafe {
+            pac::NVIC::unmask(pac::Interrupt::IO_IRQ_BANK0);
+            pac::NVIC::unmask(pac::Interrupt::TIMER_IRQ_0);
+            pac::NVIC::unmask(pac::Interrupt::TIMER_IRQ_1);
+        }
+    });
 
     loop {
-        if counter == 0 {
+        nop()
+    }
+}
+
+#[interrupt]
+fn TIMER_IRQ_1() {
+    // Create a fixed buffer to store screen contents
+    static mut BUF: Option<ArrayString<U200>> = None;
+    // The `#[interrupt]` attribute covertly converts this to `&'static mut Option<Buttons>`
+    static mut LED_SCREEN_ALARM: Option<LedScreenAlarm> = None;
+
+    // This is one-time lazy initialisation. We steal the variables given to us
+    // via `LED`.
+    if LED_SCREEN_ALARM.is_none() {
+        cortex_m::interrupt::free(|cs| {
+            *LED_SCREEN_ALARM = GLOBAL_LED_SCREEN_ALARM.borrow(cs).take();
+        });
+    }
+
+    if BUF.is_none() {
+        *BUF = Some(ArrayString::<U200>::new());
+    }
+
+    if let Some(((led, screen, alarm0), buf)) = LED_SCREEN_ALARM.as_mut().zip(*BUF).as_mut() {
+        alarm0.clear_interrupt();
+        let _ = alarm0.schedule(TIME_TICK_MS.microseconds() * 500);
+
+        if led.is_set_low().unwrap() {
             info!("on!");
             led.set_high().unwrap();
-        } else if counter == 500 {
+        } else {
             info!("off!");
             led.set_low().unwrap();
         }
 
-        let logic_tick = if counter == 0 || counter == 500 {
-            true
-        } else {
-            false
-        };
-
-        if dive_computer.depth > 0 {
-            // Underwater stuff
-            dive_computer.edt = dive_computer.edt + Milliseconds::new(TIME_TICK_MS);
-            if logic_tick {
-                dive_computer.air = dive_computer
-                    .air
-                    .saturating_sub(gas_rate_in_cl(dive_computer.depth) * 2);
-            }
-        } else {
-            // Fill air
-            if explorer.is_pressed(Button::A) {
-                dive_computer.air += AIR_INCREMENT;
-                if dive_computer.air > MAX_AIR {
-                    dive_computer.air = MAX_AIR;
-                }
-            }
-
-            // Reset rate since we can't ascend
-            dive_computer.rate = 0;
-        }
-
-        // Change unit
-        if explorer.is_pressed(Button::B) {
-            dive_computer.unit = if dive_computer.unit == Unit::Imperial {
-                Unit::Metric
-            } else {
-                Unit::Imperial
-            }
-        }
-
-        // Increase descend
-        if explorer.is_pressed(Button::X) {
-            dive_computer.rate += 1;
-            if dive_computer.rate > 50 {
-                dive_computer.rate = 50
-            }
-        }
-
-        // Increase ascend
-        if explorer.is_pressed(Button::Y) {
-            dive_computer.rate -= 1;
-            if dive_computer.rate < -50 {
-                dive_computer.rate = -50
-            }
-        }
-
-        if logic_tick {
-            // Change depth based on rate
-            dive_computer.depth = ((dive_computer.depth as i32) + (dive_computer.rate * 1000 / 120))
-                .clamp(0, i32::MAX) as u32;
-        }
-
-        // Write to buffer
         buf.clear();
-        writeln!(&mut buf, "{}", dive_computer).unwrap();
+
+        cortex_m::interrupt::free(|cs| {
+            let mut d_ref = GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut();
+            let dive_computer = d_ref.as_mut().unwrap();
+
+            // Write to buffer
+            writeln!(buf, "{}", dive_computer).unwrap();
+        });
 
         // Draw buffer on screen
         let style = MonoTextStyleBuilder::new()
@@ -277,43 +162,76 @@ fn main() -> ! {
             .text_color(Rgb565::GREEN)
             .background_color(Rgb565::BLACK)
             .build();
-        Text::with_alignment(&buf, Point::new(20, 30), style, Alignment::Left)
-            .draw(&mut explorer.screen)
-            .unwrap();
+        Text::with_alignment(buf, Point::new(20, 30), style, Alignment::Left).draw(screen).unwrap();
+    }
+}
 
-        counter += TIME_TICK_MS;
-        if counter >= 1000 {
-            counter = 0;
+#[interrupt]
+fn TIMER_IRQ_0() {
+    // The `#[interrupt]` attribute covertly converts this to `&'static mut Option<Buttons>`
+    static mut DIVE_TICK_ALARM: Option<Alarm0> = None;
+
+    // This is one-time lazy initialisation. We steal the variables given to us
+    // via `LED`.
+    if DIVE_TICK_ALARM.is_none() {
+        cortex_m::interrupt::free(|cs| {
+            *DIVE_TICK_ALARM = GLOBAL_DIVE_TICK_ALARM.borrow(cs).take();
+        });
+    }
+
+    if let Some(alarm0) = DIVE_TICK_ALARM {
+        alarm0.clear_interrupt();
+        let _ = alarm0.schedule(TIME_TICK_MS.microseconds() * 1000);
+
+        cortex_m::interrupt::free(|cs| {
+            GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut().as_mut().unwrap().change_depth(TIME_TICK_MS);
+        });
+    }
+}
+
+#[interrupt]
+fn IO_IRQ_BANK0() {
+    // The `#[interrupt]` attribute covertly converts this to `&'static mut Option<Buttons>`
+    static mut BUTTONS: Option<Buttons> = None;
+
+    // This is one-time lazy initialisation. We steal the variables given to us
+    // via `BUTTONS`.
+    if BUTTONS.is_none() {
+        cortex_m::interrupt::free(|cs| {
+            *BUTTONS = GLOBAL_BUTTONS.borrow(cs).take();
+        });
+    }
+
+    if let Some((a, b, x, y)) = BUTTONS {
+        if a.interrupt_status(EdgeLow) {
+            cortex_m::interrupt::free(|cs| {
+                GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut().as_mut().unwrap().fill_air();
+            });
+            a.clear_interrupt(EdgeLow);
         }
-        delay.delay_ms(TIME_TICK_MS);
+
+        // Change unit
+        if b.interrupt_status(EdgeLow) {
+            cortex_m::interrupt::free(|cs| {
+                GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut().as_mut().unwrap().toggle_unit();
+            });
+            b.clear_interrupt(EdgeLow);
+        }
+
+        // Increase descend
+        if x.interrupt_status(EdgeLow) {
+            cortex_m::interrupt::free(|cs| {
+                GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut().as_mut().unwrap().increase_rate();
+            });
+            x.clear_interrupt(EdgeLow);
+        }
+
+        // Increase ascend
+        if y.interrupt_status(EdgeLow) {
+            cortex_m::interrupt::free(|cs| {
+                GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut().as_mut().unwrap().decrease_rate();
+            });
+            y.clear_interrupt(EdgeLow);
+        }
     }
-}
-
-const RMV: u32 = 1200;
-const RHSV: u32 = RMV / 120;
-
-fn gas_rate_in_cl(depth_in_mm: u32) -> u32 {
-    let depth_in_m = depth_in_mm / 1000;
-
-    /* 10m of water = 1 bar = 100 centibar */
-    let ambient_pressure_in_cb = 100 + (10 * depth_in_m);
-
-    /* Gas consumed at STP = RHSV * ambient pressure / standard pressure */
-    (RHSV * ambient_pressure_in_cb) / 100
-}
-
-fn gas_to_surface_in_cl(depth_in_mm: u32) -> u32 {
-    let mut gas = 0;
-    let halfsecs_to_ascend_1m = (2 * 60) / (-MAX_SAFE_ASCEND_RATE) as u32;
-    let depth_in_m = depth_in_mm / 1000;
-
-    for depth in 0..depth_in_m {
-        gas += gas_rate_in_cl(depth * 1000) * halfsecs_to_ascend_1m;
-    }
-
-    gas
-}
-
-fn mm2ft<T: Div<Output = T> + FromPrimitive>(depth: T) -> T {
-    depth / FromPrimitive::from_u32(305).unwrap()
 }
