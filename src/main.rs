@@ -1,12 +1,12 @@
+#![deny(unsafe_code)]
+// #![deny(warnings)]
 #![no_std]
 #![no_main]
 
-use core::cell::RefCell;
-use core::fmt::Write;
+use defmt_rtt as _;
+use panic_probe as _;
 
 use arraystring::{typenum::U200, ArrayString};
-use cortex_m::{asm::nop, interrupt::Mutex};
-use cortex_m_rt::entry;
 use defmt::*;
 use defmt_rtt as _;
 use embedded_graphics::{
@@ -16,9 +16,8 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_hal::digital::v2::{OutputPin, StatefulOutputPin};
-use embedded_time::{duration::Extensions, fixed_point::FixedPoint};
+use embedded_time::fixed_point::FixedPoint;
 use panic_probe as _;
-
 // Provide an alias for our BSP so we can switch targets quickly.
 use pimoroni_pico_explorer as bsp;
 
@@ -28,18 +27,14 @@ use bsp::hal::{
     adc::Adc,
     clocks::{init_clocks_and_plls, Clock},
     gpio::{self, Interrupt::EdgeLow},
-    pac::{self, interrupt},
-    pwm,
+    pac::{self},
     sio::Sio,
-    timer::{Alarm, Alarm0, Alarm1},
     watchdog::Watchdog,
-    Timer,
 };
-
+use core::fmt::Write;
+use rp2040_monotonic::{fugit::ExtU64, Rp2040Monotonic};
 mod dive_computer;
-use dive_computer::*;
-
-const TIME_TICK_MS: u32 = 500;
+use dive_computer::DiveComputer;
 
 type APin = gpio::Pin<gpio::bank0::Gpio12, gpio::PullUpInput>;
 type BPin = gpio::Pin<gpio::bank0::Gpio13, gpio::PullUpInput>;
@@ -47,96 +42,101 @@ type XPin = gpio::Pin<gpio::bank0::Gpio14, gpio::PullUpInput>;
 type YPin = gpio::Pin<gpio::bank0::Gpio15, gpio::PullUpInput>;
 type LEDPin = gpio::Pin<gpio::bank0::Gpio25, gpio::Output<gpio::PushPull>>;
 
-type Buttons = (APin, BPin, XPin, YPin);
-type LedScreenAlarm = (LEDPin, Screen, Alarm1);
+#[rtic::app(device = bsp::hal::pac, peripherals = true, dispatchers = [TIMER_IRQ_1, TIMER_IRQ_2])]
+mod app {
 
-static GLOBAL_DIVE_COMPUTER: Mutex<RefCell<Option<DiveComputer>>> = Mutex::new(RefCell::new(None));
-static GLOBAL_BUTTONS: Mutex<RefCell<Option<Buttons>>> = Mutex::new(RefCell::new(None));
-static GLOBAL_LED_SCREEN_ALARM: Mutex<RefCell<Option<LedScreenAlarm>>> = Mutex::new(RefCell::new(None));
-static GLOBAL_DIVE_TICK_ALARM: Mutex<RefCell<Option<Alarm0>>> = Mutex::new(RefCell::new(None));
+    use super::*;
 
-#[entry]
-fn main() -> ! {
-    info!("Program start");
-    let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
+    #[monotonic(binds = TIMER_IRQ_0, default = true)]
+    type Mono = Rp2040Monotonic;
 
-    // Enable watchdog and clocks
-    let mut watchdog = Watchdog::new(pac.WATCHDOG);
-    let clocks = init_clocks_and_plls(XOSC_CRYSTAL_FREQ, pac.XOSC, pac.CLOCKS, pac.PLL_SYS, pac.PLL_USB, &mut pac.RESETS, &mut watchdog)
-        .ok()
-        .unwrap();
+    // Resources shared between tasks
+    #[shared]
+    struct Shared {
+        dive_computer: DiveComputer,
+    }
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().integer());
+    // Local resources to specific tasks (cannot be shared)
+    #[local]
+    struct Local {
+        screen: Screen,
+        led: LEDPin,
+        buffer: ArrayString<U200>,
+        button_a: APin,
+        button_b: BPin,
+        button_x: XPin,
+        button_y: YPin,
+    }
 
-    let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS);
-    let mut alarm0 = timer.alarm_0().unwrap();
-    alarm0.enable_interrupt();
-    let _ = alarm0.schedule(10.microseconds());
-    let mut alarm1 = timer.alarm_1().unwrap();
-    alarm1.enable_interrupt();
-    let _ = alarm1.schedule(10.microseconds());
-    // Enable adc
-    let adc = Adc::new(pac.ADC, &mut pac.RESETS);
+    #[init]
+    fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
+        info!("Program start");
+        let mut pac: pac::Peripherals = cx.device;
+        let mut core = cx.core;
 
-    let sio = Sio::new(pac.SIO);
+        // Enable watchdog and clocks
+        let mut watchdog = Watchdog::new(pac.WATCHDOG);
+        let clocks = init_clocks_and_plls(XOSC_CRYSTAL_FREQ, pac.XOSC, pac.CLOCKS, pac.PLL_SYS, pac.PLL_USB, &mut pac.RESETS, &mut watchdog)
+            .ok()
+            .unwrap();
+        let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().integer());
 
-    let (explorer, pins) = PicoExplorer::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, pac.SPI0, adc, &mut pac.RESETS, &mut delay);
+        let mono = Rp2040Monotonic::new(pac.TIMER);
 
-    explorer.a.set_interrupt_enabled(EdgeLow, true);
-    explorer.b.set_interrupt_enabled(EdgeLow, true);
-    explorer.x.set_interrupt_enabled(EdgeLow, true);
-    explorer.y.set_interrupt_enabled(EdgeLow, true);
+        let adc = Adc::new(pac.ADC, &mut pac.RESETS);
+        let sio = Sio::new(pac.SIO);
 
-    let led = pins.led.into_push_pull_output();
+        let (explorer, pins) = PicoExplorer::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, pac.SPI0, adc, &mut pac.RESETS, &mut delay);
 
-    let dive_computer = DiveComputer::default();
+        explorer.a.set_interrupt_enabled(EdgeLow, true);
+        explorer.b.set_interrupt_enabled(EdgeLow, true);
+        explorer.x.set_interrupt_enabled(EdgeLow, true);
+        explorer.y.set_interrupt_enabled(EdgeLow, true);
 
-    // Store for use in interrupts
-    cortex_m::interrupt::free(|cs| {
-        GLOBAL_BUTTONS.borrow(cs).replace(Some((explorer.a, explorer.b, explorer.x, explorer.y)));
-        GLOBAL_DIVE_COMPUTER.borrow(cs).replace(Some(dive_computer));
-        GLOBAL_LED_SCREEN_ALARM.borrow(cs).replace(Some((led, explorer.screen, alarm1)));
-        GLOBAL_DIVE_TICK_ALARM.borrow(cs).replace(Some(alarm0));
+        ui_output::spawn(100).unwrap();
+        // dive_tick::spawn(500).unwrap();
 
-        // Unmask the IO_BANK0 IRQ so that the NVIC interrupt controller
-        // will jump to the interrupt function when the interrupt occurs.
-        // We do this last so that the interrupt can't go off while
-        // it is in the middle of being configured
-        unsafe {
-            pac::NVIC::unmask(pac::Interrupt::IO_IRQ_BANK0);
-            pac::NVIC::unmask(pac::Interrupt::TIMER_IRQ_0);
-            pac::NVIC::unmask(pac::Interrupt::TIMER_IRQ_1);
+        // Set the ARM SLEEPONEXIT bit to go to sleep after handling interrupts
+        // See https://developer.arm.com/docs/100737/0100/power-management/sleep-mode/sleep-on-exit-bit
+        core.SCB.set_sleepdeep();
+
+        (
+            // Initialization of shared resources
+            Shared {
+                dive_computer: DiveComputer::default(),
+            },
+            // Initialization of task local resources
+            Local {
+                screen: explorer.screen,
+                led: pins.led.into_push_pull_output(),
+                buffer: ArrayString::<U200>::new(),
+                button_a: explorer.a,
+                button_b: explorer.b,
+                button_x: explorer.x,
+                button_y: explorer.y,
+            },
+            // Move the monotonic timer to the RTIC run-time, this enables
+            // scheduling
+            init::Monotonics(mono),
+        )
+    }
+
+    // Background task, runs whenever no other tasks are running
+    #[idle]
+    fn idle(_: idle::Context) -> ! {
+        loop {
+            // Now Wait For Interrupt is used instead of a busy-wait loop
+            // to allow MCU to sleep between interrupts
+            // https://developer.arm.com/documentation/ddi0406/c/Application-Level-Architecture/Instruction-Details/Alphabetical-list-of-instructions/WFI
+            rtic::export::wfi();
         }
-    });
-
-    loop {
-        nop()
-    }
-}
-
-#[interrupt]
-fn TIMER_IRQ_1() {
-    // Create a fixed buffer to store screen contents
-    static mut BUF: Option<ArrayString<U200>> = None;
-    // The `#[interrupt]` attribute covertly converts this to `&'static mut Option<Buttons>`
-    static mut LED_SCREEN_ALARM: Option<LedScreenAlarm> = None;
-
-    // This is one-time lazy initialisation. We steal the variables given to us
-    // via `LED`.
-    if LED_SCREEN_ALARM.is_none() {
-        cortex_m::interrupt::free(|cs| {
-            *LED_SCREEN_ALARM = GLOBAL_LED_SCREEN_ALARM.borrow(cs).take();
-        });
     }
 
-    if BUF.is_none() {
-        *BUF = Some(ArrayString::<U200>::new());
-    }
+    #[task(shared = [dive_computer], local = [screen, led, buffer], priority = 2)]
+    fn ui_output(mut cx: ui_output::Context, interval: u64) {
+        ui_output::spawn_after(interval.millis(), interval).unwrap();
 
-    if let Some(((led, screen, alarm0), buf)) = LED_SCREEN_ALARM.as_mut().zip(*BUF).as_mut() {
-        alarm0.clear_interrupt();
-        let _ = alarm0.schedule(TIME_TICK_MS.microseconds() * 500);
+        let ui_output::LocalResources { screen, led, buffer } = cx.local;
 
         if led.is_set_low().unwrap() {
             info!("on!");
@@ -146,14 +146,11 @@ fn TIMER_IRQ_1() {
             led.set_low().unwrap();
         }
 
-        buf.clear();
+        buffer.clear();
 
-        cortex_m::interrupt::free(|cs| {
-            let mut d_ref = GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut();
-            let dive_computer = d_ref.as_mut().unwrap();
-
+        cx.shared.dive_computer.lock(|dive_computer| {
             // Write to buffer
-            writeln!(buf, "{}", dive_computer).unwrap();
+            writeln!(buffer, "{}", dive_computer).unwrap();
         });
 
         // Draw buffer on screen
@@ -162,76 +159,49 @@ fn TIMER_IRQ_1() {
             .text_color(Rgb565::GREEN)
             .background_color(Rgb565::BLACK)
             .build();
-        Text::with_alignment(buf, Point::new(20, 30), style, Alignment::Left).draw(screen).unwrap();
+        Text::with_alignment(buffer, Point::new(20, 30), style, Alignment::Left).draw(screen).unwrap();
     }
-}
 
-#[interrupt]
-fn TIMER_IRQ_0() {
-    // The `#[interrupt]` attribute covertly converts this to `&'static mut Option<Buttons>`
-    static mut DIVE_TICK_ALARM: Option<Alarm0> = None;
+    #[task(shared = [dive_computer], local = [], priority = 2)]
+    fn dive_tick(mut cx: dive_tick::Context, interval: u64) {
+        ui_output::spawn_after(interval.millis(), interval).unwrap();
 
-    // This is one-time lazy initialisation. We steal the variables given to us
-    // via `LED`.
-    if DIVE_TICK_ALARM.is_none() {
-        cortex_m::interrupt::free(|cs| {
-            *DIVE_TICK_ALARM = GLOBAL_DIVE_TICK_ALARM.borrow(cs).take();
+        cx.shared.dive_computer.lock(|dive_computer| {
+            dive_computer.change_depth(interval as u32);
         });
     }
 
-    if let Some(alarm0) = DIVE_TICK_ALARM {
-        alarm0.clear_interrupt();
-        let _ = alarm0.schedule(TIME_TICK_MS.microseconds() * 1000);
-
-        cortex_m::interrupt::free(|cs| {
-            GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut().as_mut().unwrap().change_depth(TIME_TICK_MS);
-        });
-    }
-}
-
-#[interrupt]
-fn IO_IRQ_BANK0() {
-    // The `#[interrupt]` attribute covertly converts this to `&'static mut Option<Buttons>`
-    static mut BUTTONS: Option<Buttons> = None;
-
-    // This is one-time lazy initialisation. We steal the variables given to us
-    // via `BUTTONS`.
-    if BUTTONS.is_none() {
-        cortex_m::interrupt::free(|cs| {
-            *BUTTONS = GLOBAL_BUTTONS.borrow(cs).take();
-        });
-    }
-
-    if let Some((a, b, x, y)) = BUTTONS {
-        if a.interrupt_status(EdgeLow) {
-            cortex_m::interrupt::free(|cs| {
-                GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut().as_mut().unwrap().fill_air();
+    #[task(binds = IO_IRQ_BANK0, shared = [dive_computer], local = [button_a, button_b, button_x, button_y])]
+    fn button_handler(mut cx: button_handler::Context) {
+        if cx.local.button_a.interrupt_status(EdgeLow) {
+            cx.shared.dive_computer.lock(|dive_computer| {
+                dive_computer.fill_air();
             });
-            a.clear_interrupt(EdgeLow);
+            cx.local.button_a.clear_interrupt(EdgeLow);
         }
 
         // Change unit
-        if b.interrupt_status(EdgeLow) {
-            cortex_m::interrupt::free(|cs| {
-                GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut().as_mut().unwrap().toggle_unit();
+        if cx.local.button_b.interrupt_status(EdgeLow) {
+            cx.shared.dive_computer.lock(|dive_computer| {
+                dive_computer.toggle_unit();
             });
-            b.clear_interrupt(EdgeLow);
+            cx.local.button_b.clear_interrupt(EdgeLow);
         }
 
         // Increase descend
-        if x.interrupt_status(EdgeLow) {
-            cortex_m::interrupt::free(|cs| {
-                GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut().as_mut().unwrap().increase_rate();
+        if cx.local.button_x.interrupt_status(EdgeLow) {
+            cx.shared.dive_computer.lock(|dive_computer| {
+                dive_computer.increase_rate();
             });
-            x.clear_interrupt(EdgeLow);
+            cx.local.button_x.clear_interrupt(EdgeLow);
         }
 
         // Increase ascend
-        if y.interrupt_status(EdgeLow) {
-            cortex_m::interrupt::free(|cs| {
-                GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut().as_mut().unwrap().decrease_rate();
+        if cx.local.button_y.interrupt_status(EdgeLow) {
+            cx.shared.dive_computer.lock(|dive_computer| {
+                dive_computer.decrease_rate();
             });
-            y.clear_interrupt(EdgeLow);
+            cx.local.button_y.clear_interrupt(EdgeLow);
         }
     }
 }
