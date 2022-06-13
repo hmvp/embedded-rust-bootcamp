@@ -26,7 +26,7 @@ use bsp::{PicoExplorer, Screen, XOSC_CRYSTAL_FREQ};
 use bsp::hal::{
     adc::Adc,
     clocks::{init_clocks_and_plls, Clock},
-    gpio::{self, Interrupt::EdgeLow},
+    gpio::{self, Interrupt::EdgeLow, Interrupt::LevelLow},
     pac::{self},
     sio::Sio,
     watchdog::Watchdog,
@@ -45,7 +45,13 @@ type LEDPin = gpio::Pin<gpio::bank0::Gpio25, gpio::Output<gpio::PushPull>>;
 #[rtic::app(device = bsp::hal::pac, peripherals = true, dispatchers = [TIMER_IRQ_1, TIMER_IRQ_2])]
 mod app {
 
+    use rp2040_monotonic::fugit::{MillisDurationU64, TimerInstantU64};
+
     use super::*;
+
+    const REPEAT_TIME: u64 = 200;
+    const UI_TASK_INTERVAL: u64 = 100;
+    const LOGIC_TICK_INTERVAL: u64 = 500;
 
     #[monotonic(binds = TIMER_IRQ_0, default = true)]
     type Mono = Rp2040Monotonic;
@@ -90,11 +96,15 @@ mod app {
 
         explorer.a.set_interrupt_enabled(EdgeLow, true);
         explorer.b.set_interrupt_enabled(EdgeLow, true);
-        explorer.x.set_interrupt_enabled(EdgeLow, true);
         explorer.y.set_interrupt_enabled(EdgeLow, true);
+        explorer.x.set_interrupt_enabled(EdgeLow, true);
+        explorer.a.set_interrupt_enabled(LevelLow, true);
+        explorer.b.set_interrupt_enabled(LevelLow, true);
+        explorer.y.set_interrupt_enabled(LevelLow, true);
+        explorer.x.set_interrupt_enabled(LevelLow, true);
 
-        ui_output::spawn(100).unwrap();
-        // dive_tick::spawn(500).unwrap();
+        ui_output::spawn(UI_TASK_INTERVAL).unwrap();
+        dive_tick::spawn(LOGIC_TICK_INTERVAL).unwrap();
 
         // Set the ARM SLEEPONEXIT bit to go to sleep after handling interrupts
         // See https://developer.arm.com/docs/100737/0100/power-management/sleep-mode/sleep-on-exit-bit
@@ -164,44 +174,55 @@ mod app {
 
     #[task(shared = [dive_computer], local = [], priority = 2)]
     fn dive_tick(mut cx: dive_tick::Context, interval: u64) {
-        ui_output::spawn_after(interval.millis(), interval).unwrap();
+        dive_tick::spawn_after(interval.millis(), interval).unwrap();
 
         cx.shared.dive_computer.lock(|dive_computer| {
             dive_computer.change_depth(interval as u32);
         });
     }
 
-    #[task(binds = IO_IRQ_BANK0, shared = [dive_computer], local = [button_a, button_b, button_x, button_y])]
+    #[task(binds = IO_IRQ_BANK0, shared = [dive_computer], local = [button_a, button_b, button_x, button_y, last_triggered: u64 = 0])]
     fn button_handler(mut cx: button_handler::Context) {
-        if cx.local.button_a.interrupt_status(EdgeLow) {
-            cx.shared.dive_computer.lock(|dive_computer| {
-                dive_computer.fill_air();
-            });
-            cx.local.button_a.clear_interrupt(EdgeLow);
+        let trigger_time = monotonics::now();
+        let wait = trigger_time - TimerInstantU64::<1_000_000>::from_ticks(*cx.local.last_triggered) < MillisDurationU64::millis(REPEAT_TIME);
+
+        if !wait {
+            info!("button pushed");
         }
+
+        // Fill air
+        handle_button!(cx, trigger_time, wait, button_a, fill_air);
 
         // Change unit
-        if cx.local.button_b.interrupt_status(EdgeLow) {
-            cx.shared.dive_computer.lock(|dive_computer| {
-                dive_computer.toggle_unit();
-            });
-            cx.local.button_b.clear_interrupt(EdgeLow);
-        }
+        handle_button!(cx, trigger_time, wait, button_b, toggle_unit);
 
         // Increase descend
-        if cx.local.button_x.interrupt_status(EdgeLow) {
-            cx.shared.dive_computer.lock(|dive_computer| {
-                dive_computer.increase_rate();
-            });
-            cx.local.button_x.clear_interrupt(EdgeLow);
-        }
+        handle_button!(cx, trigger_time, wait, button_x, increase_rate);
 
         // Increase ascend
-        if cx.local.button_y.interrupt_status(EdgeLow) {
-            cx.shared.dive_computer.lock(|dive_computer| {
-                dive_computer.decrease_rate();
-            });
-            cx.local.button_y.clear_interrupt(EdgeLow);
-        }
+        handle_button!(cx, trigger_time, wait, button_y, decrease_rate);
+    }
+
+    macro_rules! handle_button {
+        ($cx:ident, $time:ident, $wait:ident, $button:tt, $func:ident) => {
+            if $cx.local.$button.interrupt_status(EdgeLow) {
+                if !$wait {
+                    $cx.shared.dive_computer.lock(|dive_computer| {
+                        dive_computer.$func();
+                    });
+                    *$cx.local.last_triggered = $time.ticks();
+                }
+                $cx.local.$button.clear_interrupt(EdgeLow);
+            }
+            if $cx.local.$button.interrupt_status(LevelLow) {
+                if !$wait {
+                    $cx.shared.dive_computer.lock(|dive_computer| {
+                        dive_computer.$func();
+                    });
+                    *$cx.local.last_triggered = ($time + MillisDurationU64::millis(REPEAT_TIME)).ticks();
+                }
+                $cx.local.$button.clear_interrupt(LevelLow);
+            }
+        };
     }
 }

@@ -1,5 +1,6 @@
 use core::{fmt, ops::Div};
 
+use defmt::info;
 use num::FromPrimitive;
 
 const MAX_DEPTH: u32 = 40_000;
@@ -95,6 +96,8 @@ impl DiveComputer {
     }
 
     pub fn fill_air(&mut self) {
+        info!("Fill air");
+
         if self.depth == 0 {
             self.air += AIR_INCREMENT;
             if self.air > MAX_AIR {
@@ -104,6 +107,8 @@ impl DiveComputer {
     }
 
     pub fn increase_rate(&mut self) {
+        info!("Increase dive rate");
+
         self.rate += 1;
         if self.rate > 50 {
             self.rate = 50
@@ -111,14 +116,19 @@ impl DiveComputer {
     }
 
     pub fn decrease_rate(&mut self) {
-        self.rate -= 1;
-        if self.rate < -50 {
-            self.rate = -50
+        info!("Decrease dive rate");
+
+        if self.depth > 0 {
+            self.rate -= 1;
+            if self.rate < -50 {
+                self.rate = -50
+            }
         }
     }
 
     pub fn change_depth(&mut self, interval: u32) {
         // Change depth based on rate
+        info!("Change depth");
 
         let hz = 1000 / interval;
         let rate_in_mm_per_interval = self.rate * 1000 / (60 * hz as i32);
@@ -126,18 +136,18 @@ impl DiveComputer {
         self.depth = ((self.depth as i32) + rate_in_mm_per_interval).clamp(0, i32::MAX) as u32;
 
         if self.depth == 0 {
-            if self.rate < 0 {
-                // Reset rate since we can't ascend out of the water
-                self.rate = 0;
-            }
+            // Reset rate since we can't ascend out of the water
+            self.rate = 0;
         } else {
             // Underwater stuff
-            self.edt = self.edt + interval as u64;
+            self.edt += interval as u64;
             self.air = self.air.saturating_sub(gas_rate_in_cl(self.depth / 1000) / hz);
         }
     }
 
     pub fn toggle_unit(&mut self) {
+        info!("Toggle measurement unit");
+
         self.unit = if self.unit == Unit::Imperial { Unit::Metric } else { Unit::Imperial }
     }
 }
