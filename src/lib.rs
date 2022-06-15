@@ -1,10 +1,17 @@
+#![cfg_attr(not(test), no_std)]
+
 use core::{fmt, ops::Div};
 
+#[cfg(not(test))]
 use defmt::info;
+use fugit::{HertzU32, MicrosDurationU32, SecsDurationU64};
+#[cfg(test)]
+use log::info;
 use num::FromPrimitive;
 
 const MAX_DEPTH: u32 = 40_000;
-const MAX_SAFE_ASCEND_RATE: i32 = -15;
+/// Max safe ascend rate in mm per minute
+const MAX_SAFE_ASCEND_RATE: u32 = 15;
 const MAX_AIR: u32 = 2000 * 100;
 const AIR_INCREMENT: u32 = 500;
 
@@ -61,11 +68,16 @@ impl fmt::Display for Alarm {
 
 // #[derive(Clone, Copy)]
 pub struct DiveComputer {
+    /// Metric or imperial
     unit: Unit,
+    /// Depth in millimeters
     depth: u32,
+    /// Rate in millimeter per minute
     rate: i32,
+    /// Air in liters
     air: u32,
-    edt: u64,
+    /// Elapsed Dive Time in seconds
+    edt: SecsDurationU64,
 }
 
 impl DiveComputer {
@@ -74,7 +86,7 @@ impl DiveComputer {
             unit: Unit::Metric,
             air: 5000,
             depth: 0,
-            edt: 0,
+            edt: SecsDurationU64::secs(0),
             rate: 0,
         }
     }
@@ -84,7 +96,7 @@ impl DiveComputer {
             return Alarm::High;
         }
 
-        if self.rate < MAX_SAFE_ASCEND_RATE {
+        if self.rate < -(MAX_SAFE_ASCEND_RATE as i32) {
             return Alarm::Medium;
         }
 
@@ -126,12 +138,12 @@ impl DiveComputer {
         }
     }
 
-    pub fn change_depth(&mut self, interval: u32) {
+    pub fn change_depth(&mut self, interval: MicrosDurationU32) {
         // Change depth based on rate
         info!("Change depth");
 
-        let hz = 1000 / interval;
-        let rate_in_mm_per_interval = self.rate * 1000 / (60 * hz as i32);
+        let hz: HertzU32 = interval.into_rate();
+        let rate_in_mm_per_interval = self.rate * 1000 / (60 * hz.raw() as i32);
 
         self.depth = ((self.depth as i32) + rate_in_mm_per_interval).clamp(0, i32::MAX) as u32;
 
@@ -140,8 +152,8 @@ impl DiveComputer {
             self.rate = 0;
         } else {
             // Underwater stuff
-            self.edt += interval as u64;
-            self.air = self.air.saturating_sub(gas_rate_in_cl(self.depth / 1000) / hz);
+            self.edt += interval.convert();
+            self.air = self.air.saturating_sub(gas_rate_in_cl(self.depth / 1000) / hz.raw());
         }
     }
 
@@ -163,9 +175,9 @@ impl fmt::Display for DiveComputer {
         let depth = if self.unit == Unit::Imperial { mm2ft(self.depth) } else { self.depth / 1000 };
         let rate = if self.unit == Unit::Imperial { mm2ft(self.rate * 1000) } else { self.rate };
 
-        let hours = self.edt / 3600000;
-        let minutes = self.edt % 3600000 / 60000;
-        let seconds = self.edt % 3600000 % 60000 / 1000;
+        let hours = self.edt.to_hours();
+        let minutes = self.edt.to_minutes();
+        let seconds = self.edt.to_secs();
 
         // Write to buffer
         writeln!(f, "DiveMaster")?;
@@ -181,16 +193,17 @@ impl fmt::Display for DiveComputer {
 const RESPIRATORY_MINUTE_VOLUME_CL: u32 = 1200;
 const RESPIRATORY_SECOND_VOLUME_CL: u32 = RESPIRATORY_MINUTE_VOLUME_CL / 60;
 
-/// Calculate gas rate in centi liter for a depth in meters
+/// Calculate gas rate per second in centiliter for a depth in meters
 ///
 /// # Examples
 ///
 /// ```
+/// use dive_computer::gas_rate_in_cl;
 /// assert_eq!(gas_rate_in_cl(0), 20);
 /// assert_eq!(gas_rate_in_cl(10), 40);
 /// ```
 ///
-fn gas_rate_in_cl(depth_in_m: u32) -> u32 {
+pub fn gas_rate_in_cl(depth_in_m: u32) -> u32 {
     /* 10m of water = 1 bar = 100 centibar */
     let ambient_pressure_in_cb = 100 + (10 * depth_in_m);
 
@@ -198,9 +211,19 @@ fn gas_rate_in_cl(depth_in_m: u32) -> u32 {
     (RESPIRATORY_SECOND_VOLUME_CL * ambient_pressure_in_cb) / 100
 }
 
-fn gas_to_surface_in_cl(depth_in_m: u32) -> u32 {
+/// Calculate gas needed to reach the surface at max safe ascend rate
+///
+/// # Examples
+///
+/// ```
+/// use dive_computer::gas_to_surface_in_cl;
+/// assert_eq!(gas_to_surface_in_cl(0), 0);
+/// assert_eq!(gas_to_surface_in_cl(10), 1160);
+/// ```
+///
+pub fn gas_to_surface_in_cl(depth_in_m: u32) -> u32 {
     let mut gas = 0;
-    let secs_to_ascend_1m = 60 / (-MAX_SAFE_ASCEND_RATE) as u32;
+    let secs_to_ascend_1m = 60 / MAX_SAFE_ASCEND_RATE;
 
     for depth in 0..depth_in_m {
         gas += gas_rate_in_cl(depth) * secs_to_ascend_1m;

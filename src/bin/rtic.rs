@@ -1,14 +1,15 @@
 #![deny(unsafe_code)]
-// #![deny(warnings)]
+#![deny(warnings)]
+#![cfg(not(test))]
 #![no_std]
 #![no_main]
+use core::fmt::Write;
 
+use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
 
 use arraystring::{typenum::U200, ArrayString};
-use defmt::*;
-use defmt_rtt as _;
 use embedded_graphics::{
     mono_font::{ascii::FONT_10X20, MonoTextStyleBuilder},
     pixelcolor::Rgb565,
@@ -17,7 +18,10 @@ use embedded_graphics::{
 };
 use embedded_hal::digital::v2::{OutputPin, StatefulOutputPin};
 use embedded_time::fixed_point::FixedPoint;
-use panic_probe as _;
+use fugit::{MicrosDurationU32, MicrosDurationU64};
+use rp2040_monotonic::Rp2040Monotonic;
+use rtic::Monotonic;
+
 // Provide an alias for our BSP so we can switch targets quickly.
 use pimoroni_pico_explorer as bsp;
 
@@ -31,9 +35,7 @@ use bsp::hal::{
     sio::Sio,
     watchdog::Watchdog,
 };
-use core::fmt::Write;
-use rp2040_monotonic::{fugit::ExtU64, Rp2040Monotonic};
-mod dive_computer;
+
 use dive_computer::DiveComputer;
 
 type APin = gpio::Pin<gpio::bank0::Gpio12, gpio::PullUpInput>;
@@ -42,16 +44,17 @@ type XPin = gpio::Pin<gpio::bank0::Gpio14, gpio::PullUpInput>;
 type YPin = gpio::Pin<gpio::bank0::Gpio15, gpio::PullUpInput>;
 type LEDPin = gpio::Pin<gpio::bank0::Gpio25, gpio::Output<gpio::PushPull>>;
 
+type Instant = <Rp2040Monotonic as Monotonic>::Instant;
+
 #[rtic::app(device = bsp::hal::pac, peripherals = true, dispatchers = [TIMER_IRQ_1, TIMER_IRQ_2])]
 mod app {
 
-    use rp2040_monotonic::fugit::{MillisDurationU64, TimerInstantU64};
-
     use super::*;
 
-    const REPEAT_TIME: u64 = 200;
-    const UI_TASK_INTERVAL: u64 = 100;
-    const LOGIC_TICK_INTERVAL: u64 = 500;
+    const REPEAT_TIME: MicrosDurationU64 = MicrosDurationU64::millis(200);
+    const DEBOUNCE_TIME: MicrosDurationU64 = MicrosDurationU64::millis(100);
+    const UI_TASK_INTERVAL: MicrosDurationU64 = MicrosDurationU64::millis(100);
+    const LOGIC_TICK_INTERVAL: MicrosDurationU64 = MicrosDurationU64::millis(500);
 
     #[monotonic(binds = TIMER_IRQ_0, default = true)]
     type Mono = Rp2040Monotonic;
@@ -143,8 +146,8 @@ mod app {
     }
 
     #[task(shared = [dive_computer], local = [screen, led, buffer], priority = 2)]
-    fn ui_output(mut cx: ui_output::Context, interval: u64) {
-        ui_output::spawn_after(interval.millis(), interval).unwrap();
+    fn ui_output(mut cx: ui_output::Context, interval: MicrosDurationU64) {
+        ui_output::spawn_after(interval, interval).unwrap();
 
         let ui_output::LocalResources { screen, led, buffer } = cx.local;
 
@@ -173,53 +176,60 @@ mod app {
     }
 
     #[task(shared = [dive_computer], local = [], priority = 2)]
-    fn dive_tick(mut cx: dive_tick::Context, interval: u64) {
-        dive_tick::spawn_after(interval.millis(), interval).unwrap();
+    fn dive_tick(mut cx: dive_tick::Context, interval: MicrosDurationU64) {
+        dive_tick::spawn_after(interval, interval).unwrap();
 
         cx.shared.dive_computer.lock(|dive_computer| {
-            dive_computer.change_depth(interval as u32);
+            dive_computer.change_depth(MicrosDurationU32::try_from(interval).unwrap());
         });
     }
 
-    #[task(binds = IO_IRQ_BANK0, shared = [dive_computer], local = [button_a, button_b, button_x, button_y, last_triggered: u64 = 0])]
+    #[task(binds = IO_IRQ_BANK0, shared = [dive_computer], local = [button_a, button_b, button_x, button_y, last_triggered: Instant = Instant::from_ticks(0)])]
     fn button_handler(mut cx: button_handler::Context) {
         let trigger_time = monotonics::now();
-        let wait = trigger_time - TimerInstantU64::<1_000_000>::from_ticks(*cx.local.last_triggered) < MillisDurationU64::millis(REPEAT_TIME);
 
-        if !wait {
-            info!("button pushed");
-        }
+        let time_waited = if trigger_time <= *cx.local.last_triggered {
+            MicrosDurationU64::from_ticks(0)
+        } else {
+            trigger_time - *cx.local.last_triggered
+        };
+
+        let mut triggered = false;
 
         // Fill air
-        handle_button!(cx, trigger_time, wait, button_a, fill_air);
+        handle_button!(cx, triggered, time_waited, button_a, fill_air);
 
         // Change unit
-        handle_button!(cx, trigger_time, wait, button_b, toggle_unit);
+        handle_button!(cx, triggered, time_waited, button_b, toggle_unit);
 
         // Increase descend
-        handle_button!(cx, trigger_time, wait, button_x, increase_rate);
+        handle_button!(cx, triggered, time_waited, button_x, increase_rate);
 
         // Increase ascend
-        handle_button!(cx, trigger_time, wait, button_y, decrease_rate);
+        handle_button!(cx, triggered, time_waited, button_y, decrease_rate);
+
+        if triggered {
+            info!("button pushed");
+            *cx.local.last_triggered = trigger_time;
+        }
     }
 
     macro_rules! handle_button {
-        ($cx:ident, $time:ident, $wait:ident, $button:tt, $func:ident) => {
+        ($cx:ident, $triggered:ident, $time_waited:ident, $button:tt, $func:ident) => {
             if $cx.local.$button.interrupt_status(EdgeLow) {
-                if !$wait {
+                if $time_waited > DEBOUNCE_TIME {
                     $cx.shared.dive_computer.lock(|dive_computer| {
                         dive_computer.$func();
                     });
-                    *$cx.local.last_triggered = $time.ticks();
+                    $triggered = true;
                 }
                 $cx.local.$button.clear_interrupt(EdgeLow);
-            }
-            if $cx.local.$button.interrupt_status(LevelLow) {
-                if !$wait {
+            } else if $cx.local.$button.interrupt_status(LevelLow) {
+                if $time_waited > REPEAT_TIME {
                     $cx.shared.dive_computer.lock(|dive_computer| {
                         dive_computer.$func();
                     });
-                    *$cx.local.last_triggered = ($time + MillisDurationU64::millis(REPEAT_TIME)).ticks();
+                    $triggered = true
                 }
                 $cx.local.$button.clear_interrupt(LevelLow);
             }
