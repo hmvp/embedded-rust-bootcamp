@@ -31,12 +31,16 @@ use bsp::hal::{
     adc::Adc,
     clocks::{init_clocks_and_plls, Clock},
     gpio::{self, Interrupt::EdgeLow, Interrupt::LevelLow},
-    pac::{self},
     sio::Sio,
     watchdog::Watchdog,
 };
 
 use dive_computer::DiveComputer;
+
+const REPEAT_TIME: MicrosDurationU64 = MicrosDurationU64::millis(200);
+const DEBOUNCE_TIME: MicrosDurationU64 = MicrosDurationU64::millis(100);
+const UI_TASK_INTERVAL: MicrosDurationU64 = MicrosDurationU64::millis(100);
+const LOGIC_TICK_INTERVAL: MicrosDurationU64 = MicrosDurationU64::millis(500);
 
 type APin = gpio::Pin<gpio::bank0::Gpio12, gpio::PullUpInput>;
 type BPin = gpio::Pin<gpio::bank0::Gpio13, gpio::PullUpInput>;
@@ -50,11 +54,6 @@ type Instant = <Rp2040Monotonic as Monotonic>::Instant;
 mod app {
 
     use super::*;
-
-    const REPEAT_TIME: MicrosDurationU64 = MicrosDurationU64::millis(200);
-    const DEBOUNCE_TIME: MicrosDurationU64 = MicrosDurationU64::millis(100);
-    const UI_TASK_INTERVAL: MicrosDurationU64 = MicrosDurationU64::millis(100);
-    const LOGIC_TICK_INTERVAL: MicrosDurationU64 = MicrosDurationU64::millis(500);
 
     #[monotonic(binds = TIMER_IRQ_0, default = true)]
     type Mono = Rp2040Monotonic;
@@ -80,7 +79,7 @@ mod app {
     #[init]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         info!("Program start");
-        let mut pac: pac::Peripherals = cx.device;
+        let mut pac = cx.device;
         let mut core = cx.core;
 
         // Enable watchdog and clocks
@@ -88,23 +87,27 @@ mod app {
         let clocks = init_clocks_and_plls(XOSC_CRYSTAL_FREQ, pac.XOSC, pac.CLOCKS, pac.PLL_SYS, pac.PLL_USB, &mut pac.RESETS, &mut watchdog)
             .ok()
             .unwrap();
+
         let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().integer());
 
-        let mono = Rp2040Monotonic::new(pac.TIMER);
-
+        // Enable adc
         let adc = Adc::new(pac.ADC, &mut pac.RESETS);
+
         let sio = Sio::new(pac.SIO);
+
+        let mono = Rp2040Monotonic::new(pac.TIMER);
 
         let (explorer, pins) = PicoExplorer::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, pac.SPI0, adc, &mut pac.RESETS, &mut delay);
 
         explorer.a.set_interrupt_enabled(EdgeLow, true);
         explorer.b.set_interrupt_enabled(EdgeLow, true);
-        explorer.y.set_interrupt_enabled(EdgeLow, true);
         explorer.x.set_interrupt_enabled(EdgeLow, true);
+        explorer.y.set_interrupt_enabled(EdgeLow, true);
+
         explorer.a.set_interrupt_enabled(LevelLow, true);
         explorer.b.set_interrupt_enabled(LevelLow, true);
-        explorer.y.set_interrupt_enabled(LevelLow, true);
         explorer.x.set_interrupt_enabled(LevelLow, true);
+        explorer.y.set_interrupt_enabled(LevelLow, true);
 
         ui_output::spawn(UI_TASK_INTERVAL).unwrap();
         dive_tick::spawn(LOGIC_TICK_INTERVAL).unwrap();
@@ -196,43 +199,43 @@ mod app {
 
         let mut triggered = false;
 
+        macro_rules! handle_button {
+            ($button:tt, $func:ident) => {
+                if cx.local.$button.interrupt_status(EdgeLow) {
+                    if time_waited > DEBOUNCE_TIME {
+                        cx.shared.dive_computer.lock(|dive_computer| {
+                            dive_computer.$func();
+                        });
+                        triggered = true;
+                    }
+                    cx.local.$button.clear_interrupt(EdgeLow);
+                } else if cx.local.$button.interrupt_status(LevelLow) {
+                    if time_waited > REPEAT_TIME {
+                        cx.shared.dive_computer.lock(|dive_computer| {
+                            dive_computer.$func();
+                        });
+                        triggered = true
+                    }
+                    cx.local.$button.clear_interrupt(LevelLow);
+                }
+            };
+        }
+
         // Fill air
-        handle_button!(cx, triggered, time_waited, button_a, fill_air);
+        handle_button!(button_a, fill_air);
 
         // Change unit
-        handle_button!(cx, triggered, time_waited, button_b, toggle_unit);
+        handle_button!(button_b, toggle_unit);
 
         // Increase descend
-        handle_button!(cx, triggered, time_waited, button_x, increase_rate);
+        handle_button!(button_x, increase_rate);
 
         // Increase ascend
-        handle_button!(cx, triggered, time_waited, button_y, decrease_rate);
+        handle_button!(button_y, decrease_rate);
 
         if triggered {
             info!("button pushed");
             *cx.local.last_triggered = trigger_time;
         }
-    }
-
-    macro_rules! handle_button {
-        ($cx:ident, $triggered:ident, $time_waited:ident, $button:tt, $func:ident) => {
-            if $cx.local.$button.interrupt_status(EdgeLow) {
-                if $time_waited > DEBOUNCE_TIME {
-                    $cx.shared.dive_computer.lock(|dive_computer| {
-                        dive_computer.$func();
-                    });
-                    $triggered = true;
-                }
-                $cx.local.$button.clear_interrupt(EdgeLow);
-            } else if $cx.local.$button.interrupt_status(LevelLow) {
-                if $time_waited > REPEAT_TIME {
-                    $cx.shared.dive_computer.lock(|dive_computer| {
-                        dive_computer.$func();
-                    });
-                    $triggered = true
-                }
-                $cx.local.$button.clear_interrupt(LevelLow);
-            }
-        };
     }
 }
