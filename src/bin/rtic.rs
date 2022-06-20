@@ -1,4 +1,3 @@
-#![deny(unsafe_code)]
 #![deny(warnings)]
 #![cfg(not(test))]
 #![no_std]
@@ -31,7 +30,7 @@ use bsp::hal::{
     adc::Adc,
     clocks::{init_clocks_and_plls, Clock},
     gpio::{self, Interrupt::EdgeLow, Interrupt::LevelLow},
-    sio::Sio,
+    sio::{self, Sio},
     watchdog::Watchdog,
 };
 
@@ -81,6 +80,12 @@ mod app {
         info!("Program start");
         let mut pac = cx.device;
         let mut core = cx.core;
+
+        // Soft-reset does not release the hardware spinlocks
+        // Release them now to avoid a deadlock after debug or watchdog reset
+        unsafe {
+            sio::spinlock_reset();
+        }
 
         // Enable watchdog and clocks
         let mut watchdog = Watchdog::new(pac.WATCHDOG);

@@ -6,7 +6,6 @@ use core::cell::RefCell;
 use core::fmt::Write;
 
 use cortex_m::interrupt::Mutex;
-use cortex_m_rt::entry;
 use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
@@ -30,6 +29,7 @@ use bsp::{PicoExplorer, Screen, XOSC_CRYSTAL_FREQ};
 use bsp::hal::{
     adc::Adc,
     clocks::{init_clocks_and_plls, Clock},
+    entry,
     gpio::{self, Interrupt::EdgeLow, Interrupt::LevelLow},
     pac::{self, interrupt},
     sio::Sio,

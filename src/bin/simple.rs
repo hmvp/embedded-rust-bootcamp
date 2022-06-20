@@ -5,7 +5,6 @@
 #![no_main]
 use core::fmt::Write;
 
-use cortex_m_rt::entry;
 use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
@@ -29,7 +28,7 @@ use bsp::{Button, PicoExplorer, XOSC_CRYSTAL_FREQ};
 use bsp::hal::{
     adc::Adc,
     clocks::{init_clocks_and_plls, Clock},
-    pac,
+    entry, pac,
     sio::Sio,
     watchdog::Watchdog,
 };
