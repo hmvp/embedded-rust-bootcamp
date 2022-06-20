@@ -17,7 +17,6 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_hal::digital::v2::{OutputPin, StatefulOutputPin};
-use embedded_time::fixed_point::FixedPoint;
 use fugit::MicrosDurationU32;
 
 // Provide an alias for our BSP so we can switch targets quickly.
@@ -49,7 +48,7 @@ fn main() -> ! {
         .ok()
         .unwrap();
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().integer());
+    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
     // Enable adc
     let adc = Adc::new(pac.ADC, &mut pac.RESETS);

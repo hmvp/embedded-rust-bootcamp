@@ -16,7 +16,6 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_hal::digital::v2::{OutputPin, StatefulOutputPin};
-use embedded_time::fixed_point::FixedPoint;
 use fugit::{MicrosDurationU32, MicrosDurationU64};
 use rp2040_monotonic::Rp2040Monotonic;
 use rtic::Monotonic;
@@ -93,7 +92,7 @@ mod app {
             .ok()
             .unwrap();
 
-        let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().integer());
+        let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
         // Enable adc
         let adc = Adc::new(pac.ADC, &mut pac.RESETS);
@@ -197,7 +196,7 @@ mod app {
         let trigger_time = monotonics::now();
 
         let time_waited = if trigger_time <= *cx.local.last_triggered {
-            MicrosDurationU64::from_ticks(0)
+            MicrosDurationU64::micros(0)
         } else {
             trigger_time - *cx.local.last_triggered
         };

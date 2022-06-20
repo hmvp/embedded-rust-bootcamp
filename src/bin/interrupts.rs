@@ -6,7 +6,7 @@ use core::cell::RefCell;
 use core::fmt::Write;
 
 use cortex_m::interrupt::Mutex;
-use defmt::*;
+use defmt::info;
 use defmt_rtt as _;
 use panic_probe as _;
 
@@ -18,8 +18,7 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use embedded_hal::digital::v2::{OutputPin, StatefulOutputPin};
-use embedded_time::{duration::Extensions, fixed_point::FixedPoint};
-use fugit::MicrosDurationU32;
+use fugit::{MicrosDurationU32, TimerInstantU32};
 
 // Provide an alias for our BSP so we can switch targets quickly.
 use pimoroni_pico_explorer as bsp;
@@ -40,15 +39,18 @@ use bsp::hal::{
 
 use dive_computer::DiveComputer;
 
-const REPEAT_TIME: u32 = 200_000;
-const DEBOUNCE_TIME: u32 = 100_000;
-const TIME_TICK_MS: u32 = 500;
+const REPEAT_TIME: MicrosDurationU32 = MicrosDurationU32::millis(200);
+const DEBOUNCE_TIME: MicrosDurationU32 = MicrosDurationU32::millis(100);
+const UI_TASK_INTERVAL: MicrosDurationU32 = MicrosDurationU32::millis(100);
+const LOGIC_TICK_INTERVAL: MicrosDurationU32 = MicrosDurationU32::millis(500);
 
 type APin = gpio::Pin<gpio::bank0::Gpio12, gpio::PullUpInput>;
 type BPin = gpio::Pin<gpio::bank0::Gpio13, gpio::PullUpInput>;
 type XPin = gpio::Pin<gpio::bank0::Gpio14, gpio::PullUpInput>;
 type YPin = gpio::Pin<gpio::bank0::Gpio15, gpio::PullUpInput>;
 type LEDPin = gpio::Pin<gpio::bank0::Gpio25, gpio::Output<gpio::PushPull>>;
+
+type Instant = TimerInstantU32<1000_000>;
 
 type ButtonsTimer = (APin, BPin, XPin, YPin, Timer);
 type LedScreenAlarm = (LEDPin, Screen, Alarm1);
@@ -70,7 +72,7 @@ fn main() -> ! {
         .ok()
         .unwrap();
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().integer());
+    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
     // Enable adc
     let adc = Adc::new(pac.ADC, &mut pac.RESETS);
@@ -80,10 +82,11 @@ fn main() -> ! {
     let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS);
     let mut alarm0 = timer.alarm_0().unwrap();
     alarm0.enable_interrupt();
-    let _ = alarm0.schedule(10.microseconds());
+    const BASE_SCHEDULE_TIME: MicrosDurationU32 = MicrosDurationU32::micros(10);
+    let _ = alarm0.schedule(BASE_SCHEDULE_TIME);
     let mut alarm1 = timer.alarm_1().unwrap();
     alarm1.enable_interrupt();
-    let _ = alarm1.schedule(10.microseconds());
+    let _ = alarm1.schedule(BASE_SCHEDULE_TIME);
 
     let (explorer, pins) = PicoExplorer::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, pac.SPI0, adc, &mut pac.RESETS, &mut delay);
 
@@ -150,9 +153,11 @@ fn TIMER_IRQ_1() {
         *BUF = Some(ArrayString::<U200>::new());
     }
 
+    info!("ui task");
+
     if let Some(((led, screen, alarm0), buffer)) = LED_SCREEN_ALARM.as_mut().zip(*BUF).as_mut() {
         alarm0.clear_interrupt();
-        let _ = alarm0.schedule(TIME_TICK_MS.microseconds() * 500);
+        let _ = alarm0.schedule(UI_TASK_INTERVAL);
 
         if led.is_set_low().unwrap() {
             info!("on!");
@@ -195,24 +200,21 @@ fn TIMER_IRQ_0() {
         });
     }
 
+    info!("logic tick");
+
     if let Some(alarm0) = DIVE_TICK_ALARM {
         alarm0.clear_interrupt();
-        let _ = alarm0.schedule(TIME_TICK_MS.microseconds() * 1000);
+        let _ = alarm0.schedule(LOGIC_TICK_INTERVAL);
 
         cortex_m::interrupt::free(|cs| {
-            GLOBAL_DIVE_COMPUTER
-                .borrow(cs)
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
-                .change_depth(MicrosDurationU32::millis(TIME_TICK_MS));
+            GLOBAL_DIVE_COMPUTER.borrow(cs).borrow_mut().as_mut().unwrap().change_depth(LOGIC_TICK_INTERVAL);
         });
     }
 }
 
 #[interrupt]
 fn IO_IRQ_BANK0() {
-    static mut LAST_TRIGGERED: u32 = 0;
+    static mut LAST_TRIGGERED: Instant = Instant::from_ticks(0);
     // The `#[interrupt]` attribute covertly converts this to `&'static mut Option<Buttons>`
     static mut BUTTONS_TIMER: Option<ButtonsTimer> = None;
 
@@ -225,12 +227,15 @@ fn IO_IRQ_BANK0() {
     }
 
     if let Some((button_a, button_b, button_x, button_y, timer)) = BUTTONS_TIMER {
-        let trigger_time = timer.get_counter_low();
-        let time_waited = if trigger_time <= *LAST_TRIGGERED { 0 } else { trigger_time - *LAST_TRIGGERED };
+        let trigger_time = Instant::from_ticks(timer.get_counter_low());
+
+        let time_waited = if trigger_time <= *LAST_TRIGGERED {
+            MicrosDurationU32::micros(0)
+        } else {
+            trigger_time - *LAST_TRIGGERED
+        };
 
         let mut triggered = false;
-
-        info!("XXXX {} {} {}", trigger_time, time_waited, *LAST_TRIGGERED);
 
         macro_rules! handle_button {
             ($button:tt, $func:ident) => {
