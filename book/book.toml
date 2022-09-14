@@ -1,0 +1,6 @@
+[book]
+authors = ["Hmvp"]
+language = "en"
+multilingual = false
+src = "src"
+title = "Embedded Rust RP2040 Introduction"
