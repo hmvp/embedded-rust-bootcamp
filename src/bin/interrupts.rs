@@ -50,7 +50,7 @@ type XPin = gpio::Pin<gpio::bank0::Gpio14, gpio::PullUpInput>;
 type YPin = gpio::Pin<gpio::bank0::Gpio15, gpio::PullUpInput>;
 type LEDPin = gpio::Pin<gpio::bank0::Gpio25, gpio::Output<gpio::PushPull>>;
 
-type Instant = TimerInstantU32<1000_000>;
+type Instant = TimerInstantU32<1_000_000>;
 
 type ButtonsTimer = (APin, BPin, XPin, YPin, Timer);
 type LedScreenAlarm = (LEDPin, Screen, Alarm1);
