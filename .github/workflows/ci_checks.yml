@@ -65,6 +65,7 @@ jobs:
       - run: rustup target install thumbv6m-none-eabi
       - run: cargo fmt -- --check
   check-book:
+    name: Check book
     runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v2
