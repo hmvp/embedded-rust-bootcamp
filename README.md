@@ -1,6 +1,6 @@
-# Project template for rp2040-hal
+# Rust Raspberry Pico Bootcamp
 
-This template is intended as a starting point for developing your own firmware based on the rp2040-hal.
+This project showcases the difficulties one might encounter when developing for embedded. It is intended for people who do have programming experience but no embedded or Rust experience.
 
 It includes all of the `knurling-rs` tooling as showcased in <https://github.com/knurling-rs/app-template> (`defmt`, `defmt-rtt`, `panic-probe`, `flip-link`) to make development as easy as possible.
 
@@ -194,7 +194,7 @@ Some of the options for your `runner` are listed below:
 NOTE These packages are under active development. As such, it is likely to
 remain volatile until a 1.0.0 release.
 
-See the [open issues](https://github.com/rp-rs/rp2040-project-template/issues) for a list of
+See the [open issues](https://github.com/hmvp/embedded-rust-bootcamp/issues) for a list of
 proposed features (and known issues).
 
 ## Contributing
@@ -215,11 +215,10 @@ The steps are:
 ## Code of Conduct
 
 Contribution to this crate is organized under the terms of the [Rust Code of
-Conduct][CoC], and the maintainer of this crate, the [rp-rs team], promises
+Conduct][CoC], and the maintainer of this crate promises
 to intervene to uphold that code of conduct.
 
 [CoC]: CODE_OF_CONDUCT.md
-[rp-rs team]: https://github.com/orgs/rp-rs/teams/rp-rs
 
 ## License
 
@@ -233,5 +232,4 @@ under these terms.
 
 ## Contact
 
-Raise an issue: [https://github.com/rp-rs/rp2040-project-template/issues](https://github.com/rp-rs/rp2040-project-template/issues)
-Chat to us on Matrix: [#rp-rs:matrix.org](https://matrix.to/#/#rp-rs:matrix.org)
+Raise an issue: [https://github.com/hmvp/embedded-rust-bootcamp/issues](https://github.com/hmvp/embedded-rust-bootcamp/issues)
