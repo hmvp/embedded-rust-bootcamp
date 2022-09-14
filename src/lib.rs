@@ -15,7 +15,7 @@ const MAX_SAFE_ASCEND_RATE: u32 = 15;
 const MAX_AIR: u32 = 2000 * 100;
 const AIR_INCREMENT: u32 = 500;
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Unit {
     Metric,
     Imperial,
